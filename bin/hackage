@@ -1,0 +1,139 @@
+#!/bin/bash -e
+
+SELF="$(basename "$0")"
+
+panic() {
+    echo "$*" >&2
+    exit 1
+}
+
+usage() {
+    panic "Usage: $SELF {id|build|publish}"
+}
+
+progress() {
+    echo "$*" >&2
+}
+
+heading() {
+    progress ">>> $*..."
+}
+
+check_for_uncommited_changes() {
+    progress "Checking for uncommited changes in current directory..."
+    test $(git status --porcelain | wc -l) -eq 0 || {
+        progress "Uncommited changes found." >&2
+        progress "You must commit them before attempting to publish a new version!" >&2
+        return 1
+    }
+}
+
+create_git_tag() {
+    VER="$1"
+    progress "Examining GIT tags..."
+    if git tag -l | fgrep -qx "$VER"
+    then
+        progress "Existing GIT tag $VER found."
+        if git tag --points-at HEAD | fgrep -qx "$VER"
+        then
+            progress "Existing GIT tag $VERSION is up to date."
+        else
+            progress "ERROR: Existing GIT tag $VERSION does not point to the repository head."
+            return 1
+        fi
+    else
+        progress "Creating GIT tag $VERSION..." &&
+        git tag -am "$VERSION" "$VERSION"
+    fi
+}
+
+strip_xml_tags() {
+    tr '\n' ' ' | sed -E 's|^.*<div id="content">(.*)</div>.*$|\1|;s|</a>||g;s|</[^>]*>|\
+|g;s|<[^>]*>||g' | sed '/^$/d'
+}
+
+# Check usage:
+test $# -eq 1 || usage
+case "$1" in
+id|build|publish)  ACTION="$1";;
+*)                 usage;;
+esac
+
+# Look for the cabal file:
+case "$(find . -maxdepth 1 -name '*.cabal' | wc -l | sed 's/^ *//')" in
+1)  CABAL_FILE="$(find . -maxdepth 1 -name '*.cabal')";;
+0)  panic "No cabal file found in the current directory.";;
+*)  panic "Multiple cabal files found in the current directory:" *.cabal;;
+esac
+
+# Extract the package name and version:
+PACKAGE="$(awk -F ":[[:space:]]*" 'tolower($1)=="name"    { print $2 }' < "$CABAL_FILE")"
+VERSION="$(awk -F ":[[:space:]]*" 'tolower($1)=="version" { print $2 }' < "$CABAL_FILE")"
+test -n "$PACKAGE" || panic "Unable to determine package name."
+test -n "$VERSION" || panic "Unable to determine package version."
+test x"$ACTION" = x"id" && {
+    echo "$PACKAGE-$VERSION"
+    exit 0
+}
+
+# Install dependencies:
+heading "Updating dependencies" &&
+cabal sandbox init &&
+cabal update &&
+cabal install --only-dependencies --upgrade-dependencies --enable-documentation ||
+exit $?
+
+# Build software:
+heading "Building software distribution" &&
+cabal build ||
+exit $?
+
+# Package software:
+heading "Packaging software distribution" &&
+cabal sdist ||
+exit $?
+
+# Build documentation:
+heading "Building documentation" &&
+cabal haddock --hoogle --hyperlink-source --executables --html \
+    --haddock-options="--built-in-themes -q aliased" \
+    --contents-location='/package/$pkgid' \
+    --html-location='/package/$pkgid/docs' &&
+tar -cz --format=ustar \
+    -f "dist/doc/html/$PACKAGE-$VERSION-docs.tar.gz" \
+    -s "|^dist/doc/html/$PACKAGE\$|$PACKAGE-$VERSION-docs|s" \
+    -s "|^dist/doc/html/$PACKAGE/|$PACKAGE-$VERSION-docs/|s" \
+    "dist/doc/html/$PACKAGE" ||
+exit $?
+
+# Do we want to publish this build?
+test x"$ACTION" = x"publish" || exit 0
+
+# Tag the repository:
+heading "Tagging the distribution in GIT" &&
+check_for_uncommited_changes &&
+create_git_tag "$VERSION" &&
+git push --tags ||
+exit $?
+
+# Upload the software distribution to hackage:
+heading "Publishing software distribution to hackage" &&
+curl -f -s -S -X POST --netrc-optional \
+    -H 'Accept: text/plain' \
+    -F "package=@dist/$PACKAGE-$VERSION.tar.gz" \
+    "https://hackage.haskell.org/cgi-bin/hackage-scripts/protected/upload-pkg" ||
+exit $?
+
+# Upload the documentation to hackage:
+heading "Publishing documentatation to hackage" &&
+curl -f -s -S -X PUT --netrc-optional \
+    -H 'Content-Type: application/x-tar' \
+    -H 'Content-Encoding: gzip' \
+    -H 'Accept: text/plain' \
+    --data-binary "@dist/doc/html/$PACKAGE-$VERSION-docs.tar.gz" \
+    "https://hackage.haskell.org/package/$PACKAGE-$VERSION/docs" | strip_xml_tags ||
+exit $?
+
+# All done.
+echo ">>> Done." >&2
+exit 0
